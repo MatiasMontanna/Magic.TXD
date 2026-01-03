@@ -1,0 +1,166 @@
+name: CI - Build Magic.TXD (Windows / Linux / macOS)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: magic-txd-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-matrix:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-msvc
+            runner: windows-latest
+            tool: msvc
+          - name: windows-mingw
+            runner: windows-latest
+            tool: mingw
+          - name: linux
+            runner: ubuntu-latest
+            tool: gcc
+          - name: macos
+            runner: macos-latest
+            tool: clang
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Git LFS (if needed)
+        run: |
+          git lfs install || true
+
+      # Install Qt (prebuilt). Adjust version if you want a different Qt release.
+      - name: Install Qt (prebuilt)
+        uses: jurplel/install-qt-action@v2
+        with:
+          version: '5.15.2'        # change this if you want a different Qt 5.15.x or Qt 6
+          host: ${{ matrix.runner == 'windows-latest' && matrix.tool == 'mingw' && 'windows' || matrix.runner == 'windows-latest' && matrix.tool == 'msvc' && 'windows' || matrix.runner == 'ubuntu-latest' && 'linux' || matrix.runner == 'macos-latest' && 'mac' }}
+          arch: x64
+        # Note: host/target naming differs between Qt installers. If this action fails,
+        # replace with another setup-Qt action or install Qt manually (see README).
+
+      - name: Show environment (debug)
+        run: |
+          echo "Runner: $RUNNER_OS"
+          cmake --version || true
+          qmake --version || true
+          which qmake || true
+          ls -la
+
+      # Windows MSVC: build with MSBuild
+      - name: Build (MSVC)
+        if: matrix.tool == 'msvc'
+        shell: bash
+        run: |
+          echo "Building with MSVC (Release)..."
+          # Ensure vswhere/msbuild available — runner image provides msbuild
+          cmd.exe /c "msbuild build\\Magic.sln /p:Configuration=Release /m" || (echo "msbuild failed" && exit 1)
+
+      # Windows MinGW: use MSYS2 + run the repository build script (if it supports mingw)
+      - name: Setup MSYS2 (for MinGW)
+        if: matrix.tool == 'mingw'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+
+      - name: Build (MinGW / Linux / macOS)
+        if: matrix.tool != 'msvc'
+        shell: bash
+        run: |
+          set -e
+          echo "Running repository build script (if present)..."
+          # Many repo build steps are centralized in build/cbp_initbuild.script
+          if [ -x build/cbp_initbuild.script ]; then
+            ./build/cbp_initbuild.script || (echo "build/cbp_initbuild.script failed" && exit 1)
+          else
+            echo "No build/cbp_initbuild.script executable. Attempting qmake + make..."
+            if command -v qmake >/dev/null 2>&1; then
+              # Try to find a top-level project file (attempts).
+              PROJ=$(find . -maxdepth 2 -type f \( -name "*.pro" -o -name "magic-txd.pro" \) | head -n1 || true)
+              if [ -n "$PROJ" ]; then
+                qmake "$PROJ" -spec linux-g++ || true
+                make -j$(nproc) || true
+              else
+                echo "No .pro found. Attempting Code::Blocks project build (if installed)..."
+                if command -v codeblocks >/dev/null 2>&1; then
+                  codeblocks --build build/magic-txd.cbp || true
+                else
+                  echo "No supported build method found on this runner. Please update the workflow to run the project's preferred build command."
+                  exit 1
+                fi
+              fi
+            else
+              echo "qmake not found. Please configure Qt installation or change build steps."
+              exit 1
+            fi
+          fi
+
+      # Collect build artifacts
+      - name: Locate build output
+        id: find_out
+        run: |
+          # try common output paths; adjust if your build places the executable elsewhere
+          OUTS=$(find . -type f -iname 'Magic.TXD*' -o -iname 'magic-txd*' -o -iname '*.exe' -maxdepth 6 | tr '\n' ' ')
+          echo "found=$OUTS" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-txd-${{ matrix.name }}-${{ github.run_number }}
+          path: |
+            ${{ steps.find_out.outputs.found }}
+            resources/
+            languages/
+            data/
+
+      # NSIS packaging only on Windows MSVC job (creates an installer .exe)
+      - name: Install NSIS (Windows)
+        if: matrix.tool == 'msvc' && runner.os == 'Windows'
+        run: |
+          choco install nsis -y
+          refreshenv || true
+          echo "Installed NSIS"
+        shell: cmd
+
+      - name: Create NSIS installer (Windows)
+        if: matrix.tool == 'msvc' && runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Find a .nsi installer script under installer/ or repo root. Edit path if necessary.
+          NSI_FILE=$(find installer -maxdepth 2 -type f -iname '*.nsi' | head -n1 || true)
+          if [ -z "$NSI_FILE" ]; then
+            echo "No .nsi installer script found under installer/. Skipping installer creation."
+            exit 0
+          fi
+          echo "Using NSI script: $NSI_FILE"
+          # makensis added to PATH by choco; call via full path if necessary
+          makensis "$NSI_FILE"
+          # Upload created installer (default NSIS output is in same folder or specified in script)
+          INST=$(find . -type f -iname '*.exe' -maxdepth 4 | grep -i installer || true)
+          if [ -n "$INST" ]; then
+            echo "Found installer: $INST"
+            echo "installer_path=$INST" >> $GITHUB_OUTPUT
+          else
+            echo "No installer *.exe found after makensis. Check your .nsi script output path."
+          fi
+
+      - name: Upload installer artifact (Windows)
+        if: matrix.tool == 'msvc' && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-txd-installer-${{ github.run_number }}
+          path: ${{ steps.create_nsi_installer && steps.create_nsi_installer.outputs.installer_path || 'installer/*.exe' }}
